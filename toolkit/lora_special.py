@@ -15,7 +15,7 @@ from .config_modules import NetworkConfig
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
 
-from toolkit.kohya_lora import LoRANetwork
+from toolkit.kohya_lora import LoRANetwork, parse_block_lr_kwargs
 from toolkit.models.DoRA import DoRAModule
 from typing import TYPE_CHECKING
 
@@ -306,6 +306,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             block_alphas: Optional[List[float]] = None,
             conv_block_dims: Optional[List[int]] = None,
             conv_block_alphas: Optional[List[float]] = None,
+            down_lr_weight: Union[List[float], str, None] = None,
+            mid_lr_weight: Union[float, str, None] = None,
+            up_lr_weight: Union[List[float], str, None] = None,
             modules_dim: Optional[Dict[str, int]] = None,
             modules_alpha: Optional[Dict[str, int]] = None,
             module_class: Type[object] = LoRAModule,
@@ -714,6 +717,23 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         self.down_lr_weight: List[float] = None
         self.mid_lr_weight: float = None
         self.block_lr = False
+
+        # Per-block learning-rate weights (kohya-style). The plain LoRANetwork
+        # factory sets these, but the special-network path (used for krea2 and
+        # other DiTs) instantiates LoRASpecialNetwork directly, so wire them up
+        # here — after the None/FALSE defaults above so they stick. For flat DiT
+        # block naming (e.g. krea2 "blocks.N") the mapping is:
+        # down_lr_weight[0..11] -> blocks 0-11, mid_lr_weight -> block 12,
+        # up_lr_weight[0..11] -> blocks 13-24 (last entry clamped for 25+).
+        if down_lr_weight is not None or mid_lr_weight is not None or up_lr_weight is not None:
+            d_lr, m_lr, u_lr = parse_block_lr_kwargs(
+                {
+                    "down_lr_weight": down_lr_weight,
+                    "mid_lr_weight": mid_lr_weight,
+                    "up_lr_weight": up_lr_weight,
+                }
+            )
+            self.set_block_lr_weight(u_lr, m_lr, d_lr)
 
         # assertion
         names = set()

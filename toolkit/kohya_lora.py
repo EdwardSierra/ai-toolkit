@@ -16,6 +16,14 @@ import re
 
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
+# Flat transformer block naming (e.g. krea2: "transformer$$diffusion_model$$blocks$$18$$mlp$$gate"
+# or legacy-underscore form "..._model_blocks_18_..."). The lookbehinds exclude the
+# keyword prefixes that precede "blocks" in UNet/Flux naming (down_blocks,
+# up_blocks, double_blocks, single_blocks, transformer_blocks); a model path
+# like "..._model_blocks_18" is a genuine flat block name and still matches.
+RE_FLAT_BLOCK = re.compile(
+    r"(?<!down_)(?<!up_)(?<!double_)(?<!single_)(?<!transformer_)blocks[.$_]{1,2}(\d+)"
+)
 
 
 class LoRAModule(torch.nn.Module):
@@ -697,6 +705,12 @@ def get_block_index(lora_name: str) -> int:
     elif "mid_block_" in lora_name:
         block_idx = LoRANetwork.NUM_OF_BLOCKS  # idx=12
 
+    if block_idx < 0:
+        # Flat DiT block naming (krea2 etc.): the block index is the literal N.
+        m2 = RE_FLAT_BLOCK.search(lora_name)
+        if m2:
+            block_idx = int(m2.group(1))
+
     return block_idx
 
 
@@ -1022,7 +1036,10 @@ class LoRANetwork(torch.nn.Module):
                 lr_weight = self.mid_lr_weight
         elif block_idx > LoRANetwork.NUM_OF_BLOCKS:
             if self.up_lr_weight != None:
-                lr_weight = self.up_lr_weight[block_idx - LoRANetwork.NUM_OF_BLOCKS - 1]
+                # clamp to the last entry: flat DiTs (e.g. krea2, 28 blocks)
+                # have more blocks than the SD-style 12-entry up list
+                i = min(block_idx - LoRANetwork.NUM_OF_BLOCKS - 1, len(self.up_lr_weight) - 1)
+                lr_weight = self.up_lr_weight[i]
 
         return lr_weight
 
