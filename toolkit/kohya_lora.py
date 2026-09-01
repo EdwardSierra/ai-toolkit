@@ -24,6 +24,11 @@ RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers
 RE_FLAT_BLOCK = re.compile(
     r"(?<!down_)(?<!up_)(?<!double_)(?<!single_)(?<!transformer_)blocks[.$_]{1,2}(\d+)"
 )
+# Module path following a flat DiT block index (e.g. "blocks$$18$$attn$$wq" or
+# saved-key form "diffusion_model.blocks.18.mlp.gate"). Group 1 is the module
+# family (attn|mlp), group 2 the submodule (wq/wv/wo/wk/gate for attn,
+# down/gate/up for mlp).
+RE_FLAT_MODULE = re.compile(r"blocks[.$_]{1,2}\d+[.$_]{1,2}(attn|mlp)[.$_]{1,2}(\w+)")
 
 
 class LoRAModule(torch.nn.Module):
@@ -427,6 +432,32 @@ def parse_block_lr_kwargs(nw_kwargs):
     return down_lr_weight, mid_lr_weight, up_lr_weight
 
 
+def parse_module_lr_weights(value: Union[str, dict, None]) -> Optional[dict]:
+    # Per-module learning-rate weights, e.g. "attn:0.5,mlp.gate:2.5" ->
+    # {"attn": 0.5, "mlp.gate": 2.5}. Module kinds are produced by
+    # get_module_kind (attn / mlp.down / mlp.gate / mlp.up / txtfusion / other).
+    # Kinds not listed keep weight 1.0. Returns None when unset/empty.
+    if value is None:
+        return None
+    weights = {}
+    if isinstance(value, dict):
+        for kind, w in value.items():
+            weights[str(kind)] = float(w)
+    else:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(f"module_lr_weights entry {part!r} must be 'kind:weight' (e.g. 'mlp.gate:2.5')")
+            kind, w = part.split(":", 1)
+            weights[kind.strip()] = float(w.strip())
+    if weights:
+        print("apply module learning rate / モジュール別学習率を適用します。")
+        print("module_lr_weights:", weights)
+    return weights or None
+
+
 def create_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -505,6 +536,10 @@ def create_network(
 
     if up_lr_weight is not None or mid_lr_weight is not None or down_lr_weight is not None:
         network.set_block_lr_weight(up_lr_weight, mid_lr_weight, down_lr_weight)
+
+    module_lr_weights = parse_module_lr_weights(kwargs.get("module_lr_weights", None))
+    if module_lr_weights is not None:
+        network.set_module_lr_weight(module_lr_weights)
 
     return network
 
@@ -714,6 +749,26 @@ def get_block_index(lora_name: str) -> int:
     return block_idx
 
 
+# Module kind for per-module lr weights, derived from the LoRA's module path.
+# Flat DiT naming (krea2): "...blocks$$18$$attn$$wq" or the saved-key form
+# "diffusion_model.blocks.18.attn.gate" -> "attn" (any attn submodule);
+# "...blocks$$18$$mlp$$gate" -> "mlp.gate" (also mlp.up / mlp.down).
+# txtfusion layerwise blocks -> "txtfusion". Legacy SD-UNet names: attention
+# modules -> "attn", ff_net -> "mlp". Anything else (text encoders, conv
+# in/out, ...) -> "other" (keeps weight 1.0 unless explicitly listed).
+def get_module_kind(lora_name: str) -> str:
+    if "txtfusion" in lora_name:
+        return "txtfusion"
+    m = RE_FLAT_MODULE.search(lora_name)
+    if m:
+        return "attn" if m.group(1) == "attn" else f"mlp.{m.group(2)}"
+    if "attention" in lora_name:
+        return "attn"
+    if "ff_net" in lora_name:
+        return "mlp"
+    return "other"
+
+
 # Create network from weights for inference, weights are not loaded here (because can be merged)
 def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weights_sd=None, for_inference=False, **kwargs):
     if weights_sd is None:
@@ -754,6 +809,10 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
     down_lr_weight, mid_lr_weight, up_lr_weight = parse_block_lr_kwargs(kwargs)
     if up_lr_weight is not None or mid_lr_weight is not None or down_lr_weight is not None:
         network.set_block_lr_weight(up_lr_weight, mid_lr_weight, down_lr_weight)
+
+    module_lr_weights = parse_module_lr_weights(kwargs.get("module_lr_weights", None))
+    if module_lr_weights is not None:
+        network.set_module_lr_weight(module_lr_weights)
 
     return network, weights_sd
 
@@ -940,6 +999,7 @@ class LoRANetwork(torch.nn.Module):
         self.down_lr_weight: List[float] = None
         self.mid_lr_weight: float = None
         self.block_lr = False
+        self.module_lr_weights: dict = None
 
         # assertion
         names = set()
@@ -1022,6 +1082,16 @@ class LoRANetwork(torch.nn.Module):
         self.mid_lr_weight = mid_lr_weight
         self.up_lr_weight = up_lr_weight
 
+    # 模块别学习率用に模块种类ごとの学习率对する倍率を定义する
+    # (per-module lr weights: multiplied on top of the per-block weight)
+    def set_module_lr_weight(self, module_lr_weights: dict):
+        self.module_lr_weights = module_lr_weights
+
+    def get_module_lr_weight(self, lora: LoRAModule) -> float:
+        if not self.module_lr_weights:
+            return 1.0
+        return self.module_lr_weights.get(get_module_kind(lora.lora_name), 1.0)
+
     def get_lr_weight(self, lora: LoRAModule) -> float:
         lr_weight = 1.0
         block_idx = get_block_index(lora.lora_name)
@@ -1061,23 +1131,26 @@ class LoRANetwork(torch.nn.Module):
             all_params.append(param_data)
 
         if self.unet_loras:
-            if self.block_lr:
-                # 学習率のグラフをblockごとにしたいので、blockごとにloraを分類
-                block_idx_to_lora = {}
+            if self.block_lr or self.module_lr_weights:
+                # 学習率のグラフを(block, module)ごとにしたいので、
+                # (block index, module kind)ごとにloraを分類する
+                group_key_to_lora = {}
                 for lora in self.unet_loras:
-                    idx = get_block_index(lora.lora_name)
-                    if idx not in block_idx_to_lora:
-                        block_idx_to_lora[idx] = []
-                    block_idx_to_lora[idx].append(lora)
+                    key = (get_block_index(lora.lora_name), get_module_kind(lora.lora_name))
+                    if key not in group_key_to_lora:
+                        group_key_to_lora[key] = []
+                    group_key_to_lora[key].append(lora)
 
-                # blockごとにパラメータを設定する
-                for idx, block_loras in block_idx_to_lora.items():
-                    param_data = {"params": enumerate_params(block_loras)}
+                # (block, module)ごとにパラメータを設定する
+                # 学習率 = base_lr * block_weight * module_weight
+                for key, group_loras in group_key_to_lora.items():
+                    param_data = {"params": enumerate_params(group_loras)}
+                    group_weight = self.get_lr_weight(group_loras[0]) * self.get_module_lr_weight(group_loras[0])
 
                     if unet_lr is not None:
-                        param_data["lr"] = unet_lr * self.get_lr_weight(block_loras[0])
+                        param_data["lr"] = unet_lr * group_weight
                     elif default_lr is not None:
-                        param_data["lr"] = default_lr * self.get_lr_weight(block_loras[0])
+                        param_data["lr"] = default_lr * group_weight
                     if ("lr" in param_data) and (param_data["lr"] == 0):
                         continue
                     all_params.append(param_data)

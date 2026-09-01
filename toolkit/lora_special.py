@@ -15,7 +15,7 @@ from .config_modules import NetworkConfig
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
 
-from toolkit.kohya_lora import LoRANetwork, parse_block_lr_kwargs
+from toolkit.kohya_lora import LoRANetwork, parse_block_lr_kwargs, parse_module_lr_weights
 from toolkit.models.DoRA import DoRAModule
 from typing import TYPE_CHECKING
 
@@ -309,6 +309,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             down_lr_weight: Union[List[float], str, None] = None,
             mid_lr_weight: Union[float, str, None] = None,
             up_lr_weight: Union[List[float], str, None] = None,
+            module_lr_weights: Union[str, dict, None] = None,
             modules_dim: Optional[Dict[str, int]] = None,
             modules_alpha: Optional[Dict[str, int]] = None,
             module_class: Type[object] = LoRAModule,
@@ -717,6 +718,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         self.down_lr_weight: List[float] = None
         self.mid_lr_weight: float = None
         self.block_lr = False
+        self.module_lr_weights: dict = None
 
         # Per-block learning-rate weights (kohya-style). The plain LoRANetwork
         # factory sets these, but the special-network path (used for krea2 and
@@ -734,6 +736,13 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 }
             )
             self.set_block_lr_weight(u_lr, m_lr, d_lr)
+
+        # Per-module learning-rate weights (attn / mlp.down / mlp.gate /
+        # mlp.up / txtfusion), multiplied on top of the per-block weights in
+        # prepare_optimizer_params. Kinds come from get_module_kind; unlisted
+        # kinds keep weight 1.0.
+        if module_lr_weights is not None:
+            self.set_module_lr_weight(parse_module_lr_weights(module_lr_weights))
 
         # assertion
         names = set()
