@@ -4,7 +4,6 @@ import inspect
 import json
 import random
 import shutil
-import time
 from collections import OrderedDict
 import os
 import re
@@ -2515,11 +2514,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
-        # Per-run accumulators for the human-readable progress postfix:
-        # a stable average seconds/iteration (for an accurate ETA) and a
-        # running average of the training loss (alongside the current loss).
-        _train_loop_start_time = time.time()
-        _completed_steps = 0
+        # Running average of the training loss for the progress postfix
+        # (the plain "loss:" field is the current step's value only). The
+        # stable average s/it + accurate ETA are handled by
+        # ToolkitProgressBar.format_dict, so no timing state is needed here.
         _loss_sum = 0.0
         _loss_count = 0
         for step in range(start_step_num, self.train_config.steps):
@@ -2682,21 +2680,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    # Accumulate per-run stats for a stable, human-readable ETA
-                    # and a running average loss (the plain "loss:" field above
-                    # is the current step's value only).
-                    _completed_steps += 1
+                    # Running average loss for the postfix (the "loss:" field
+                    # above is the current step's value only).
                     _loss_key = 'loss' if 'loss' in loss_dict else next(iter(loss_dict), None)
                     if _loss_key is not None:
                         _loss_sum += float(loss_dict[_loss_key])
                         _loss_count += 1
                     _avg_loss = _loss_sum / _loss_count if _loss_count > 0 else 0.0
-                    _avg_s_it = (time.time() - _train_loop_start_time) / _completed_steps if _completed_steps > 0 else 0.0
 
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
-                    prog_bar_string += f" avg_loss: {_avg_loss:.3e} avg: {_avg_s_it:.2f}s/it"
+                    prog_bar_string += f" avg_loss: {_avg_loss:.3e}"
 
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
