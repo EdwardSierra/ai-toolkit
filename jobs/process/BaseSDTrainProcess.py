@@ -4,7 +4,7 @@ import inspect
 import json
 import random
 import shutil
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import os
 import re
 import traceback
@@ -2514,12 +2514,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
-        # Running average of the training loss for the progress postfix
-        # (the plain "loss:" field is the current step's value only). The
-        # stable average s/it + accurate ETA are handled by
-        # ToolkitProgressBar.format_dict, so no timing state is needed here.
-        _loss_sum = 0.0
-        _loss_count = 0
+        # Rolling window of recent losses for the progress postfix: a moving
+        # average over the last ~100 steps (the plain "loss:" field is the
+        # current step's value only). A window, rather than a whole-run mean,
+        # tracks the CURRENT loss trend instead of being diluted by the high
+        # early-training losses. The stable average s/it + accurate ETA are
+        # handled by ToolkitProgressBar.format_dict, so no timing state is
+        # needed here.
+        _loss_window = deque(maxlen=100)
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2680,13 +2682,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    # Running average loss for the postfix (the "loss:" field
-                    # above is the current step's value only).
+                    # Rolling average loss (last ~100 steps) for the postfix;
+                    # the "loss:" field above is the current step's value.
                     _loss_key = 'loss' if 'loss' in loss_dict else next(iter(loss_dict), None)
                     if _loss_key is not None:
-                        _loss_sum += float(loss_dict[_loss_key])
-                        _loss_count += 1
-                    _avg_loss = _loss_sum / _loss_count if _loss_count > 0 else 0.0
+                        _loss_window.append(float(loss_dict[_loss_key]))
+                    _avg_loss = sum(_loss_window) / len(_loss_window) if _loss_window else 0.0
 
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
